@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Voice Chat — Saabash Beta (Robust Mic)</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#000;color:#fff;font-family:system-ui,-apple-system,'Segoe UI',Roboto;display:flex;flex-direction:column;height:100vh}
+  .status{position:fixed;left:50%;top:10px;transform:translateX(-50%);background:rgba(10,10,10,.95);padding:8px 12px;border-radius:12px;border:1px solid #222;display:flex;align-items:center;gap:10px;font-size:13px;z-index:10}
+  .dot{width:9px;height:9px;border-radius:50%;background:#444}
+  .dot.record{background:#f55;box-shadow:0 0 8px rgba(255,0,0,.18)}
+  .chat{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:10px}
+  .message{background:#0a0a0a;border:1px solid #161616;border-radius:12px;padding:10px 14px;max-width:78%;word-wrap:break-word;color:#ccc;font-size:14px;display:inline-block}
+  .user{align-self:flex-end;background:linear-gradient(180deg,#062,#093);color:#fff}
+  .assistant{align-self:flex-start;background:#0a0a0a;color:#ddd}
+  .interim{opacity:.6;border-style:dashed;color:#aaa}
+  .sfx{align-self:center;background:linear-gradient(90deg,#1a1a40,#1b243b);color:#fff;padding:8px 12px;font-weight:600}
+  .meta{font-size:11px;color:#888;margin-top:6px}
+  .controls{display:flex;gap:10px;padding:12px;border-top:1px solid #111;background:#000;align-items:center}
+  input[type="text"]{flex:1;background:#0a0a0a;border-radius:20px;border:1px solid #1a1a1a;padding:10px 14px;color:#fff;font-size:14px}
+  .btn{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid #1a1a1a;background:#0a0a0a;cursor:pointer}
+  .sfx-controls{display:flex;gap:8px;align-items:center}
+  .sfx-select{background:#0a0a0a;border:1px solid #1a1a1a;color:#fff;padding:8px;border-radius:8px}
+  .sfx-play{padding:8px 10px;border-radius:8px;border:1px solid #1a1a1a;background:#0a0a0a;color:#fff;cursor:pointer}
+  #micMeter{width:120px;height:8px;background:#111;border-radius:6px;overflow:hidden;border:1px solid #222}
+  #micFill{height:100%;width:0;background:linear-gradient(90deg,#6f6,#3b6)}
+  .debug{font-size:12px;color:#bbb;margin-left:6px}
+  .big{padding:10px 14px;border-radius:8px;background:#111;border:1px solid #222;cursor:pointer}
+  @media(max-width:720px){.message{max-width:92%}}
+</style>
+</head>
+<body>
+  <div class="status" id="statusBar">
+    <div id="dot" class="dot"></div>
+    <div id="statusText">initializing...</div>
+    <div id="micMeter" style="margin-left:8px;"><div id="micFill"></div></div>
+    <div style="margin-left:10px" id="permControls"></div>
+  </div>
+
+  <div class="chat" id="chat"></div>
+
+  <div class="controls">
+    <div class="sfx-controls">
+      <select id="sfxSelect" class="sfx-select"><option value="wigglywobbly.ogg">Saabash Beta</option><option value="boop.ogg">Boop</option></select>
+      <button id="playSfx" class="sfx-play">Play</button>
+      <button id="saabBtn" class="sfx-play">Saabash Beta</button>
+    </div>
+
+    <button id="micToggle" class="btn" title="Toggle mic">
+      <svg style="width:18px;height:18px;fill:#999" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+    </button>
+
+    <input id="txt" type="text" placeholder="Type a message..." />
+    <button id="send" class="btn"><svg style="width:18px;height:18px;fill:#999" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+  </div>
+
+<script>
+/* Robust continuous speech page
+   - requests mic permission early using getUserMedia
+   - keeps a silent stream open (VAD meter)
+   - aggressively restarts SpeechRecognition with tiny backoff
+   - pauses recognition during TTS/SFX and resumes
+   - shows debug & permission UI
+*/
+
+const chat = document.getElementById('chat');
+const statusText = document.getElementById('statusText');
+const dot = document.getElementById('dot');
+const micFill = document.getElementById('micFill');
+const permControls = document.getElementById('permControls');
+
+const sfxSelect = document.getElementById('sfxSelect');
+const playSfx = document.getElementById('playSfx');
+const saabBtn = document.getElementById('saabBtn');
+const micToggle = document.getElementById('micToggle');
+const txt = document.getElementById('txt');
+const sendBtn = document.getElementById('send');
+
+let recognition = null;
+let interimEl = null;
+let shouldListen = true;      // user wants always listening
+let isRecording = false;
+let pausingForTTS = false;
+let pausingForSfx = false;
+let audioStream = null;       // getUserMedia stream (keeps permission & VAD)
+let audioCtx = null;
+let analyser = null;
+let restartAttempt = 0;
+const HISTORY_KEY = 'voiceChatMessages_v1';
+
+// helper: show status
+function setStatus(s){
+  statusText.textContent = s;
+}
+function setDot(recording){
+  dot.className = 'dot' + (recording? ' record' : '');
+}
+
+// history
+function loadHistory(){ try{ const r=localStorage.getItem(HISTORY_KEY); return r?JSON.parse(r):[] } catch(e){return[]} }
+function saveHistory(a){ try{ localStorage.setItem(HISTORY_KEY, JSON.stringify(a)) } catch(e){} }
+function pushHistory(o){ const a=loadHistory(); a.push(o); saveHistory(a); }
+
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
+
+function render(msg, who='assistant', isInterim=false, isSfx=false, sfxFile=''){
+  if (isInterim){
+    if (!interimEl){ interimEl = document.createElement('div'); interimEl.className='message assistant interim'; chat.appendChild(interimEl); }
+    interimEl.textContent = msg;
+    return;
+  }
+  if (interimEl){ interimEl.remove(); interimEl=null; }
+  const el = document.createElement('div');
+  if (isSfx){ el.className='message sfx'; el.innerHTML = `<div class="body">🔊 ${escapeHtml(msg)}${ sfxFile ? ` — <small>${escapeHtml(sfxFile)}</small>` : '' }</div><div class="meta">${new Date().toLocaleTimeString()}</div>`; }
+  else { el.className = 'message ' + (who==='user' ? 'user' : 'assistant'); el.innerHTML = `<div class="body">${escapeHtml(msg)}</div><div class="meta">${new Date().toLocaleTimeString()}</div>`; }
+  chat.appendChild(el);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+// typed send + TTS (pauses recognition while TTS plays)
+function speakText(text){
+  if (!('speechSynthesis' in window)) return;
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.pitch = 1; utter.rate = 1;
+  const wasListening = (recognition && shouldListen && isRecording);
+  if (wasListening){ pausingForTTS = true; shouldListen = false; try{ recognition.stop(); }catch(e){} }
+  utter.onend = ()=>{ if (wasListening){ shouldListen = true; pausingForTTS = false; setTimeout(()=> tryStartRecognition(true), 150); } };
+  utter.onerror = ()=>{ if (wasListening){ shouldListen = true; pausingForTTS = false; setTimeout(()=> tryStartRecognition(true), 150); } };
+  speechSynthesis.cancel(); speechSynthesis.speak(utter);
+}
+
+function addMessage(text, who='assistant', isInterim=false, isSfx=false, sfxFile=''){
+  if (isInterim){ render(text, who, true); return; }
+  render(text, who, false, isSfx, sfxFile);
+  pushHistory({ text, sender: who, ts: Date.now(), isSfx: !!isSfx, sfxFile: sfxFile||'' });
+}
+
+// SFX play (pauses recognition)
+function playSfxFile(file, label){
+  if (!file) return;
+  const wasListening = (recognition && shouldListen && isRecording);
+  if (wasListening){ pausingForSfx = true; shouldListen = false; try{ recognition.stop(); }catch(e){} }
+  addMessage(label || file.replace(/\.[^/.]+$/,''), 'assistant', false, true, file);
+  const audio = new Audio(file);
+  audio.preload='auto';
+  audio.play().catch(err => { console.error('sfx play failed', err); setStatus('SFX play failed'); setTimeout(()=>setStatus('idle'),800); });
+  audio.onended = ()=>{ if (wasListening){ shouldListen = true; pausingForSfx = false; setTimeout(()=> tryStartRecognition(true), 120); } };
+  audio.onerror = ()=>{ if (wasListening){ shouldListen = true; pausingForSfx = false; setTimeout(()=> tryStartRecognition(true), 120); } };
+}
+
+// mic permission & silent stream for VAD
+async function ensureMicAccess(auto=false){
+  try {
+    // prefer constraints with AGC & noise suppression off? try to ask for best
+    audioStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }});
+    setStatus('mic allowed');
+    initMeter(audioStream);
+    // if speech recognition not started, try to start
+    if (auto) tryStartRecognition(true);
+    return true;
+  } catch (err){
+    console.warn('getUserMedia failed', err);
+    setStatus('mic permission blocked/denied');
+    showGrantButton();
+    return false;
+  }
+}
+
+function showGrantButton(){
+  permControls.innerHTML = '';
+  const btn = document.createElement('button');
+  btn.textContent = 'Grant Mic';
+  btn.className = 'big';
+  btn.onclick = ()=> { ensureMicAccess(true); btn.disabled = true; btn.textContent = 'Waiting...' };
+  permControls.appendChild(btn);
+}
+
+// small VU meter
+function initMeter(stream){
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const iv = setInterval(()=>{
+      if (!analyser) return;
+      analyser.getByteTimeDomainData(data);
+      let sum=0;
+      for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+      const rms = Math.sqrt(sum/data.length);
+      const pct = Math.min(1, rms*8);
+      micFill.style.width = Math.round(pct*100)+'%';
+    }, 60);
+    // stop meter when page unloads
+    window.addEventListener('beforeunload', ()=>{ clearInterval(iv); try{ stream.getTracks().forEach(t=>t.stop()); audioCtx&&audioCtx.close(); }catch(e){} });
+  } catch(e){ console.warn('meter init failed', e); }
+}
+
+// Robust SpeechRecognition init
+function initRecognition(){
+  if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)){ setStatus('SpeechRecognition unsupported'); return; }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SR();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = 'en-US';
+
+  recognition.onstart = ()=>{ isRecording = true; restartAttempt = 0; setStatus('listening'); setDot(true); };
+  recognition.onresult = (ev)=>{
+    let interim=''; let final='';
+    for (let i=ev.resultIndex;i<ev.results.length;i++){
+      const t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) final += t;
+      else interim += t;
+    }
+    if (interim) addMessage(interim, 'assistant', true);
+    if (final) addMessage(final.trim(), 'assistant', false);
+  };
+  recognition.onerror = (ev)=>{ console.warn('rec error', ev); /* let onend handle restarts */ };
+  recognition.onend = ()=>{
+    isRecording = false; setDot(false);
+    // If we paused for TTS/SFX don't auto restart (those handlers will)
+    if (pausingForTTS || pausingForSfx) return;
+    // If user asked always-listen, restart aggressively with tiny backoff
+    if (shouldListen){
+      restartAttempt++;
+      const delay = Math.min(1200, 60 * Math.pow(1.3, Math.min(restartAttempt, 8))); // tiny base, slight growth
+      setTimeout(()=> {
+        tryStartRecognition();
+      }, Math.max(30, Math.round(delay)));
+    } else {
+      setStatus('idle');
+    }
+  };
+
+  // auto-start only if we already have mic permission (audioStream)
+  if (audioStream && shouldListen) tryStartRecognition(true);
+}
+
+// start recognition with error handling
+function tryStartRecognition(force=false){
+  if (!recognition) initRecognition();
+  if (!recognition) return;
+  // some browsers require a user gesture to start; calling start may throw
+  try {
+    recognition.start();
+  } catch (err){
+    // If it throws "InvalidStateError", try tiny delayed attempts
+    console.warn('recognition.start failed', err);
+    setTimeout(()=> {
+      try { recognition.start(); } catch(e){ console.warn('retry start failed', e); }
+    }, 80);
+  }
+}
+
+// UI events
+sendBtn.addEventListener('click', ()=>{ const t = txt.value.trim(); if(!t) return; addMessage(t,'user',false,false); txt.value=''; speakText(t); });
+txt.addEventListener('keypress', e=>{ if(e.key==='Enter') sendBtn.click(); });
+
+playSfx.addEventListener('click', ()=>{ const file = sfxSelect.value; const label = sfxSelect.options[sfxSelect.selectedIndex].text; playSfxFile(file,label); });
+saabBtn.addEventListener('click', ()=> playSfxFile('wigglywobbly.ogg','Saabash Beta'));
+
+micToggle.addEventListener('click', ()=>{
+  // toggle user's desire to keep listening
+  shouldListen = !shouldListen;
+  if (shouldListen){
+    setStatus('user requested listening');
+    tryStartRecognition(true);
+  } else {
+    try{ recognition && recognition.stop(); }catch(e){}
+    setStatus('listening stopped');
+  }
+});
+
+// page visibility / focus -> restart
+document.addEventListener('visibilitychange', ()=>{ if (!document.hidden && shouldListen) tryStartRecognition(true); });
+window.addEventListener('focus', ()=>{ if (shouldListen) tryStartRecognition(true); });
+
+// startup: attempt to get mic immediately (some browsers allow), otherwise show Grant button
+(async function startup(){
+  setStatus('starting...');
+  // Try to detect current permission state
+  try {
+    if (navigator.permissions && navigator.permissions.query){
+      const p = await navigator.permissions.query({ name: 'microphone' });
+      if (p.state === 'granted'){
+        await ensureMicAccess(true);
+      } else if (p.state === 'prompt'){
+        // attempt to request mic once (may trigger browser prompt)
+        await ensureMicAccess(true);
+      } else {
+        setStatus('mic denied — click Grant Mic');
+        showGrantButton();
+      }
+      p.onchange = ()=> { /* permission changed — reload or re-init */ };
+    } else {
+      // fallback: just try getUserMedia
+      await ensureMicAccess(true);
+    }
+  } catch(err){
+    console.warn('startup mic catch', err);
+    showGrantButton();
+  }
+
+  // init SpeechRecognition object & try to start if permission present
+  initRecognition();
+  if (audioStream && shouldListen) tryStartRecognition(true);
+
+  // expose debug helper
+  window.__voiceChat = { ensureMicAccess, playSfxFile, addMessage, tryStartRecognition, recognition };
+  setTimeout(()=> setStatus('ready'), 400);
+})();
+
+// restore chat history
+(function renderHistory(){
+  const arr = loadHistory();
+  arr.forEach(m => render(m.text, m.sender, false, !!m.isSfx, m.sfxFile));
+})();
+
+// Helpful diagnostic tips (small overlay) - not interactive, just visible on first load if mic fails
+setTimeout(()=>{
+  if (!audioStream){
+    const tip = document.createElement('div');
+    tip.style.position='fixed'; right='12px'; tip.style.bottom='12px';
+    // append short actionable tips next to permControls
+    permControls.innerHTML += '<div class="debug" style="margin-left:12px">Tips: Use Chrome, allow mic, close other apps using mic, increase OS mic level, try headset.</div>';
+  }
+},900);
+
+</script>
+</body>
+</html>
